@@ -86,5 +86,5 @@ typing_extensions==4.15.0
 tzdata==2026.2
 uvicorn==0.48.0
 watchfiles==1.2.0
-websockets==16.0
+websockets==14.2
 wrapt==2.2.1
