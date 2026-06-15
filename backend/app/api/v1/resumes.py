@@ -9,13 +9,14 @@ import os
 from typing import List
 
 from fastapi import APIRouter, Depends, UploadFile, File, Path
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db
 from app.api.deps import get_current_recruiter_id
 from app.core.exceptions import FileProcessingException
-from app.services.resume_service import ResumeService
+from app.core.supabase_storage import download_file
+from app.services.resume_service import ResumeService, MIME_TYPES
 from app.schemas.resume import ResumeUploadResponse, ZipUploadResponse, ResumeResponse
 
 router = APIRouter()
@@ -75,13 +76,23 @@ async def download_resume(
     recruiter_id: int = Depends(get_current_recruiter_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """Download the original resume file."""
+    """Download the original resume file from Supabase Storage."""
     service = ResumeService(db)
     resume = await service.get_resume(resume_id)
-    return FileResponse(
-        path=resume.file_path,
-        filename=resume.original_filename,
-        media_type="application/octet-stream",
+
+    # Download file bytes from Supabase Storage
+    file_bytes = download_file(resume.file_path)
+
+    # Determine content type from the original filename
+    ext = os.path.splitext(resume.original_filename)[1].lower()
+    content_type = MIME_TYPES.get(ext, "application/octet-stream")
+
+    return Response(
+        content=file_bytes,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{resume.original_filename}"',
+        },
     )
 
 

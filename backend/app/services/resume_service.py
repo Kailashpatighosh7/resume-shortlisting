@@ -3,20 +3,26 @@ Resume Service
 ==============
 Handles resume upload, file storage, parsing, and embedding generation.
 Supports both individual file uploads and bulk ZIP archive uploads.
+
+Files are stored in Supabase Storage.  Text extraction still uses
+local temp files (pdfplumber / python-docx require filesystem paths)
+which are cleaned up immediately after use.
 """
 
-import os
 import json
 import uuid
 import zipfile
 import logging
-from typing import List, Tuple
+import tempfile
+import os
+from typing import List
 
 from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import FileProcessingException, NotFoundException
+from app.core.supabase_storage import upload_file, delete_file
 from app.models.candidate import Candidate
 from app.models.resume import Resume
 from app.repositories.candidate_repo import CandidateRepository
@@ -29,6 +35,13 @@ from app.schemas.resume import ResumeUploadResponse, ZipUploadResponse, ResumeRe
 logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc"}
+
+# MIME types for common resume formats
+MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+}
 
 
 class ResumeService:
@@ -44,26 +57,39 @@ class ResumeService:
     async def _process_single_resume(
         self,
         job_id: int,
-        file_path: str,
+        file_bytes: bytes,
         original_filename: str,
     ) -> bool:
         """
-        Process a single resume file that already exists on disk.
+        Process a single resume from raw bytes.
 
-        Pipeline: extract text → parse structured data → generate embedding
+        Pipeline: write to temp file → extract text → parse structured data
+                  → generate embedding → upload to Supabase Storage
                   → create Candidate → create Resume record.
 
         Args:
             job_id: The job this resume belongs to.
-            file_path: Absolute path to the saved file on disk.
+            file_bytes: Raw file content.
             original_filename: The original name of the uploaded file.
 
         Returns:
             True if processing succeeded, False otherwise.
         """
+        ext = os.path.splitext(original_filename)[1].lower()
+        storage_path = None
+
         try:
-            # Extract text
-            parsed_text = extract_text(file_path)
+            # Write to temp file for text extraction (pdfplumber/docx need paths)
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+
+            try:
+                # Extract text
+                parsed_text = extract_text(tmp_path)
+            finally:
+                # Always clean up temp file
+                os.unlink(tmp_path)
 
             # Parse structured data
             parsed_data = parse_resume_text(parsed_text)
@@ -76,6 +102,17 @@ class ResumeService:
             except Exception:
                 embedding_json = None
 
+            # Upload to Supabase Storage with a unique path
+            unique_name = f"{uuid.uuid4().hex}{ext}"
+            storage_path = f"job_{job_id}/{unique_name}"
+            content_type = MIME_TYPES.get(ext, "application/octet-stream")
+
+            upload_file(
+                path=storage_path,
+                file_bytes=file_bytes,
+                content_type=content_type,
+            )
+
             # Create candidate
             candidate = Candidate(
                 job_id=job_id,
@@ -86,11 +123,11 @@ class ResumeService:
             )
             candidate = await self.candidate_repo.create(candidate)
 
-            # Create resume record
+            # Create resume record (file_path stores the Supabase storage path)
             resume = Resume(
                 candidate_id=candidate.id,
                 original_filename=original_filename,
-                file_path=file_path,
+                file_path=storage_path,
                 parsed_text=parsed_text,
                 parsed_data=parsed_data.model_dump(),
                 resume_embedding=embedding_json,
@@ -100,9 +137,12 @@ class ResumeService:
 
         except Exception as e:
             logger.error(f"Failed to process resume '{original_filename}': {e}")
-            # Clean up file on error
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            # Clean up Supabase file on error
+            if storage_path:
+                try:
+                    delete_file(storage_path)
+                except Exception:
+                    pass
             return False
 
     # ── Individual File Upload ────────────────────────────────
@@ -117,18 +157,15 @@ class ResumeService:
 
         For each file:
         1. Validate file type
-        2. Save to disk
-        3. Extract text
+        2. Read bytes
+        3. Extract text (via temp file)
         4. Parse structured data
         5. Generate embedding
-        6. Create candidate + resume records
+        6. Upload to Supabase Storage
+        7. Create candidate + resume records
         """
         uploaded = 0
         candidates_created = 0
-
-        # Job-specific upload directory
-        job_dir = os.path.join(settings.UPLOAD_DIR, "resumes", f"job_{job_id}")
-        os.makedirs(job_dir, exist_ok=True)
 
         for file in files:
             # Validate extension
@@ -141,15 +178,8 @@ class ResumeService:
             if len(contents) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
                 continue
 
-            # Save file to disk with original filename
-            safe_name = os.path.basename(file.filename)
-            file_path = self._resolve_unique_path(job_dir, safe_name)
-
-            with open(file_path, "wb") as f:
-                f.write(contents)
-
             success = await self._process_single_resume(
-                job_id, file_path, file.filename
+                job_id, contents, file.filename
             )
             if success:
                 uploaded += 1
@@ -173,12 +203,11 @@ class ResumeService:
 
         Steps:
         1. Validate ZIP size
-        2. Save to temp location
+        2. Save to system temp file
         3. Open and validate the archive
         4. Prevent ZIP Slip / path traversal
-        5. Extract supported files to job-specific directory
-        6. Process each resume independently (errors don't halt others)
-        7. Return statistics
+        5. Read each file as bytes and process
+        6. Return statistics
         """
         # ── Read & validate size ──
         contents = await zip_file.read()
@@ -192,20 +221,17 @@ class ResumeService:
         if len(contents) == 0:
             raise FileProcessingException("Uploaded file is empty")
 
-        # ── Save temp ZIP ──
-        temp_dir = os.path.join(settings.UPLOAD_DIR, "temp")
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_zip_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.zip")
-
-        with open(temp_zip_path, "wb") as f:
-            f.write(contents)
+        # ── Save to system temp file (auto-cleaned) ──
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp.write(contents)
+            temp_zip_path = tmp.name
 
         try:
             return await self._extract_and_process_zip(job_id, temp_zip_path)
         finally:
             # Always clean up temp ZIP
             if os.path.exists(temp_zip_path):
-                os.remove(temp_zip_path)
+                os.unlink(temp_zip_path)
 
     async def _extract_and_process_zip(
         self,
@@ -251,12 +277,6 @@ class ResumeService:
                     f"maximum of {settings.MAX_ZIP_FILE_COUNT}"
                 )
 
-            # ── Prepare job directory ──
-            job_dir = os.path.join(
-                settings.UPLOAD_DIR, "resumes", f"job_{job_id}"
-            )
-            os.makedirs(job_dir, exist_ok=True)
-
             processed = 0
             failed = 0
             candidates_created = 0
@@ -279,19 +299,17 @@ class ResumeService:
                     failed += 1
                     continue
 
-                # ── Extract to disk ──
-                file_path = self._resolve_unique_path(job_dir, original_name)
+                # ── Read file bytes from ZIP ──
                 try:
-                    with zf.open(info) as src, open(file_path, "wb") as dst:
-                        dst.write(src.read())
+                    file_bytes = zf.read(info)
                 except Exception as e:
-                    logger.error(f"Failed to extract '{original_name}': {e}")
+                    logger.error(f"Failed to read '{original_name}' from ZIP: {e}")
                     failed += 1
                     continue
 
                 # ── Process resume ──
                 success = await self._process_single_resume(
-                    job_id, file_path, original_name
+                    job_id, file_bytes, original_name
                 )
                 if success:
                     processed += 1
@@ -310,31 +328,6 @@ class ResumeService:
             ),
         )
 
-    # ── Helpers ───────────────────────────────────────────────
-
-    @staticmethod
-    def _resolve_unique_path(directory: str, filename: str) -> str:
-        """
-        Resolve a unique file path in the given directory.
-
-        If `filename` already exists, appends _1, _2, etc. before the
-        extension to avoid overwriting.
-
-        Args:
-            directory: Target directory path.
-            filename: Desired filename.
-
-        Returns:
-            Full path that does not collide with existing files.
-        """
-        name, ext = os.path.splitext(filename)
-        candidate_path = os.path.join(directory, filename)
-        counter = 1
-        while os.path.exists(candidate_path):
-            candidate_path = os.path.join(directory, f"{name}_{counter}{ext}")
-            counter += 1
-        return candidate_path
-
     # ── Read / Delete ─────────────────────────────────────────
 
     async def get_resume(self, resume_id: int) -> ResumeResponse:
@@ -352,13 +345,16 @@ class ResumeService:
         return ResumeResponse.model_validate(resume)
 
     async def delete_resume(self, resume_id: int) -> bool:
-        """Delete a resume and its file."""
+        """Delete a resume and its file from Supabase Storage."""
         resume = await self.resume_repo.get_by_id(resume_id)
         if not resume:
             raise NotFoundException(f"Resume #{resume_id} not found")
 
-        # Delete file
-        if resume.file_path and os.path.exists(resume.file_path):
-            os.remove(resume.file_path)
+        # Delete file from Supabase Storage
+        if resume.file_path:
+            try:
+                delete_file(resume.file_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete storage file '{resume.file_path}': {e}")
 
         return await self.resume_repo.delete(resume_id)

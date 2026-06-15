@@ -35,8 +35,12 @@ class Settings(BaseSettings):
     # ── CORS ─────────────────────────────────────────────────
     CORS_ORIGINS: List[str] = ["https://resumeshortlisst.netlify.app", "http://localhost:3000"]
 
-    # ── File Upload ──────────────────────────────────────────
-    UPLOAD_DIR: str = "./uploads"
+    # ── Supabase Storage ──────────────────────────────────────
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
+    SUPABASE_STORAGE_BUCKET: str = "resumes"
+
+    # ── File Upload (validation limits) ──────────────────────
     MAX_FILE_SIZE_MB: int = 10
     MAX_ZIP_SIZE_MB: int = 200
     MAX_ZIP_FILE_COUNT: int = 500

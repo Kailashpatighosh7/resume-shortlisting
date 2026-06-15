@@ -5,13 +5,11 @@ Creates and configures the main FastAPI application instance
 with CORS, exception handlers, and route registration.
 """
 
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 
@@ -21,10 +19,8 @@ from app.core.config import settings
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown events."""
-    # Startup: ensure upload directory exists
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     print(f"🚀 {settings.APP_NAME} v{settings.APP_VERSION} starting...")
-    print(f"📁 Upload directory: {os.path.abspath(settings.UPLOAD_DIR)}")
+    print(f"☁️  Storage: Supabase Storage (bucket: {settings.SUPABASE_STORAGE_BUCKET})")
     yield
     # Shutdown
     print("👋 Application shutting down...")
@@ -54,10 +50,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Mount Static Files for Uploads ────────────────────────────
-
-os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 
 # ── Global Exception Handler ─────────────────────────────────
 
